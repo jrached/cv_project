@@ -346,7 +346,7 @@ def play_video(dir_path, videos):
 
                     # If row doesn't have 3 videos, pad row 
                     if row_width != stacked_width: 
-                        pad = np.zeros((row_height, stacked_width - row_width, row_channels), dtype=np.uint8)
+                        pad = 255 * np.ones((row_height, stacked_width - row_width, row_channels), dtype=np.uint8)
                         frame_row = np.hstack((frame_row, pad)) 
 
                     stacked_frame = np.vstack((stacked_frame, frame_row))
@@ -375,7 +375,7 @@ def empty_out_dir(out_path):
 
 if __name__=="__main__":
     ######## To run: ####################################################
-    # python3 scene_flow_clean.py --model=models/raft-things.pth --path=data/kimera2 
+    # python3 scene_flow.py --model=models/raft-things.pth --path=data/kimera2 
     #####################################################################
     out_path = '/home/jrached/cv_project_code/project/data/out'
     videos = ["/original.mp4", "/geometric_flow.mp4", "/raft_flow.mp4", "/residual_flow.mp4", "/processed_flow.mp4"]
