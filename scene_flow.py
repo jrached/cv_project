@@ -24,20 +24,31 @@ from raft import RAFT
 from utils import flow_viz
 from utils.utils import InputPadder
 
-
-# From project 
-sys.path.append('../project')
-from viz_data import load_image, load_poses
-
 DEVICE = 'cuda'
 MAX_DEPTH = 8
 
 #############################
 ### Data Extraction Code ####
 #############################
+def load_image(img_file, depth=False): 
+    """
+    Given an mp4 file, load the image 
+
+    Inputs: 
+        - img_file, path to mp4 image file 
+    Outputs: 
+        - imgage as numpy array 
+    """ 
+    if not depth: 
+        return np.array(Image.open(img_file)).astype(np.uint8)
+    else: 
+        return np.array(Image.open(img_file)) 
+
+def load_poses(pose_file): 
+    return pd.read_csv(pose_file).to_numpy().reshape(-1, 4, 4) 
 
 # Create generators for depth, color, and poses 
-def make_generators(path_to_split, split_index, num_samples=1000):
+def make_generators(path_to_split, split_index, num_samples=500):
     """
     Make generators for depth, color, and poses 
     from the data extracted from the bags.
@@ -58,13 +69,13 @@ def make_generators(path_to_split, split_index, num_samples=1000):
     start = split_index * num_samples
     def depth_generator():
         for i in range(start, start + num_samples): 
-            yield np.clip(load_image(path_to_split + f'/depth/depth_img{i}.png', depth=True) / 1000, 0.5, MAX_DEPTH) # Convert to meters
+            yield np.clip(load_image(path_to_split + f'/depth/depth_img{i}.png', depth=True) / 1000, -0.5, MAX_DEPTH) # Convert to meters
 
     def rgb_generator(): 
         for i in range(start, start + num_samples): 
             yield load_image(path_to_split + f'/color/color_img{i}.png') 
         
-    poses = load_poses(path_to_split + f'/poses/poses_rdp.csv')
+    poses = load_poses(path_to_split + f'/poses/quad_poses_rdp.csv') #TODO: Change to just poses_rdp.csv
     def pose_generator(): 
         for pose in poses: 
             yield pose 
@@ -89,7 +100,7 @@ def smooth_flow(alpha, curr_flow, prev_flow):
     """
     return alpha * curr_flow + (1 - alpha) * prev_flow
 
-def scene_flow(curr_depth, prev_depth, curr_pose, prev_pose, intrinsics, inv_intrinsics):
+def scene_flow(curr_depth, prev_depth, curr_pose, prev_pose, intrinsics, inv_intrinsics, cam_to_rover=np.eye(4)):
     """
     Computes the scene flow for each frame. 
 
@@ -111,17 +122,23 @@ def scene_flow(curr_depth, prev_depth, curr_pose, prev_pose, intrinsics, inv_int
     pixel_coords_c1 = np.stack((xs, ys), axis=-1).reshape(-1, 2)
     pixel_coords_c1 = np.hstack((pixel_coords_c1, np.ones((h*w, 1))))
 
+    # Remove coords with no depth measurements 
+    prev_depth = prev_depth.flatten()
+    valid_mask = np.isfinite(prev_depth) & (prev_depth > 0)
+    valid_depth = prev_depth[valid_mask]
+    valid_coords_c1 = pixel_coords_c1[valid_mask, :]
+    flat_shape = valid_coords_c1.shape[0]
+    
     # Unproject pixel coords to 3D scene: X_c1 = Z * K**-1 @ x_pix1 
-    prev_depth = prev_depth[pixel_coords_c1[:, 1].astype(int), pixel_coords_c1[:, 0].astype(int)]
-    points_c1f = prev_depth.reshape(h*w, 1) * (inv_intrinsics @ pixel_coords_c1.T).T
-    points_c1f = np.hstack((points_c1f, np.ones((h*w, 1))))         
+    points_c1f = valid_depth.reshape(-1, 1) * (inv_intrinsics @ valid_coords_c1.T).T
+    points_c1f = np.hstack((points_c1f, np.ones((flat_shape, 1))))         
 
     # Transform 3D poitns from frame 1 frame to world frame 
-    extrinsics = prev_pose
+    extrinsics =  prev_pose @ cam_to_rover
     points_wf = (extrinsics @ points_c1f.T).T 
 
     # Transform to frame 2 frame 
-    extrinsics = np.linalg.inv(curr_pose)
+    extrinsics = np.linalg.inv(cam_to_rover) @ np.linalg.inv(curr_pose) 
     points_c2f = (extrinsics @ points_wf.T).T[:, :-1] 
     
     # Project 3D points to frame 2 image 
@@ -129,7 +146,12 @@ def scene_flow(curr_depth, prev_depth, curr_pose, prev_pose, intrinsics, inv_int
     pixel_coords_c2 = (intrinsics @ points_c2f.T).T 
 
     # Compute flow as displacement of pixel coordinates 
-    geo_flow = (pixel_coords_c2[:, :-1] - pixel_coords_c1[:, :-1]).reshape(h, w, 2)
+    geo_flow_flat = (pixel_coords_c2[:, :-1] - valid_coords_c1[:, :-1])
+
+    # Rebuild image to right shape without bad values 
+    output = np.full((h * w, 2), fill_value=0.0)
+    output[valid_mask] = geo_flow_flat 
+    geo_flow = output.reshape(h, w, 2)
 
     return geo_flow, curr_depth, curr_pose 
 
@@ -185,16 +207,17 @@ def post_process_flow(curr_depth, prev_depth, flow, prev_flow, alpha, flow_thres
         scaled_flow = flow
         
     # Threshold to remove noisy flow (norm of flow vectors)
+    base_thresh = 0.0 # TODO make a param 
     flow_norms = np.linalg.norm(scaled_flow, axis=-1).reshape(h, w, 1)
     mask = flow_norms.copy()
-    mask[flow_norms < flow_thresh] = 0
-    mask[flow_norms >= flow_thresh] = 1
+    mask[flow_norms < base_thresh + flow_thresh * curr_depth.reshape(h, w, 1) / 8] = 0
+    mask[flow_norms >= base_thresh + flow_thresh * curr_depth.reshape(h, w, 1) / 8] = 1
     mask = np.broadcast_to(mask, (h, w, 2))
     masked_flow = mask * scaled_flow 
 
     return masked_flow, prev_flow  
 
-def raft_and_scene_flow(args, intrinsics, video_writers, split_index=14, viz=False):
+def raft_and_scene_flow(args, alpha, flow_thresh, intrinsics, video_writers, split_index=14, viz=False):
     """
     Computes residuals between RAFT optical flow and geometric optical flow.  
 
@@ -220,7 +243,7 @@ def raft_and_scene_flow(args, intrinsics, video_writers, split_index=14, viz=Fal
     inv_intrinsics = np.linalg.inv(intrinsics)
 
     # Extract openCV video writers 
-    vw1, vw2, vw3, vw4, vw5 = video_writers 
+    vw1, vw2, vw3, vw4, vw5, vw6 = video_writers 
 
     with torch.no_grad():
         # Initialize pose, depth, img.
@@ -231,14 +254,12 @@ def raft_and_scene_flow(args, intrinsics, video_writers, split_index=14, viz=Fal
         # Smoothing parameters
         h, w = prev_depth.shape 
         prev_flow = np.zeros((h, w, 2))
-        alpha = 0.4
-        flow_thresh = 4
 
         for curr_depth, curr_pose, img in zip(depth_generator, pose_generator, rgb_generator):
             vw1.write(img[:, :, ::-1])
 
             # Compute geometric flow 
-            geo_flow, prev_depth, prev_pose = scene_flow(curr_depth, prev_depth, curr_pose, prev_pose, intrinsics, inv_intrinsics)
+            geo_flow, prev_depth, prev_pose = scene_flow(curr_depth, prev_depth, curr_pose, prev_pose, intrinsics, inv_intrinsics, cam_to_rover=T_FLURDF)
             vw2.write(flow_viz.flow_to_image(geo_flow)[:, :, ::-1])
 
             # Compute RAFT flow  
@@ -250,8 +271,15 @@ def raft_and_scene_flow(args, intrinsics, video_writers, split_index=14, viz=Fal
             vw4.write(flow_viz.flow_to_image(flow)[:, :, ::-1])
 
             # Clean up signal 
-            processed_flow, prev_flow = post_process_flow(curr_depth, prev_depth, flow, prev_flow, alpha, flow_thresh)
+            processed_flow, prev_flow = post_process_flow(curr_depth, prev_depth, flow, prev_flow, alpha, flow_thresh, scale_by_depth=True)
             vw5.write(flow_viz.flow_to_image(processed_flow)[:, :, ::-1])
+
+            # Generate flow masked video 
+            masked_frame = img.copy()
+            processed_flow_norms = np.broadcast_to(np.linalg.norm(processed_flow, axis=-1).reshape(h, w, 1), (h, w, 3))
+            masked_frame[processed_flow_norms == 0] = 0 
+            masked_frame[processed_flow_norms != 0] = 255
+            vw6.write(masked_frame[:, :, ::-1])
 
             # Visualize flow  
             if viz: 
@@ -373,20 +401,22 @@ def play_video(dir_path, videos):
 def empty_out_dir(out_path):
     subprocess.run(["rm", "-rf", out_path + "/*"])
 
-if __name__=="__main__":
-    ######## To run: ####################################################
-    # python3 scene_flow.py --model=models/raft-things.pth --path=data/kimera2 
-    #####################################################################
-    out_path = '/home/jrached/cv_project_code/project/data/out'
-    videos = ["/original.mp4", "/geometric_flow.mp4", "/raft_flow.mp4", "/residual_flow.mp4", "/processed_flow.mp4"]
+def get_intrinsics(intrinsics_path):
+    return pd.read_csv(intrinsics_path).to_numpy().reshape(3, 3)
+
+############
+### Main ###
+############
+
+def main(alpha, flow_thresh, split_number, only_viz=False):
+
+    fps = 15 # 30.0
+    frame_size = (848, 480) # OpenCV uses (width, height) order
+    out_path = f'/home/jrached/cv_project_code/project/data/highbay_out/split{split_number}'
+    videos = ["/original.mp4", "/geometric_flow.mp4", "/raft_flow.mp4", "/residual_flow.mp4", "/processed_flow.mp4", "/flow_masked_image.mp4"]
     only_viz = True
 
     if not only_viz: 
-        ### Params 
-        split_number = 13
-        fps = 15 # 30.0
-        frame_size = (640, 480) # OpenCV uses (width, height) order
-
         ### RAFT Params 
         path_to_raft = '/home/jrached/cv_project_code/RAFT/'
         parser = argparse.ArgumentParser()
@@ -395,18 +425,8 @@ if __name__=="__main__":
         parser.add_argument('--small', action='store_true', help='use small model')
         parser.add_argument('--mixed_precision', action='store_true', help='use mixed precision')
         parser.add_argument('--alternate_corr', action='store_true', help='use efficent correlation implementation')
-        args = parser.parse_args()
-        args.model = path_to_raft + args.model 
-
-        # RGB intrinsics TODO: Write to csv file 
-        rgb_intrinsics = np.array([[380.80969238,   0.0,          315.84698486],
-                                [0.0,            380.53787231, 238.04495239],
-                                [0.0,            0.0,          1.0         ]])
-
-        # Depth intrinsics TODO: Write these to a csv file
-        depth_intrinsics = np.array([[386.88305664,   0.0,          312.75875854],
-                                    [  0.0,         386.88305664, 237.32907104],
-                                    [  0.0,         0.0,          1.0         ]])
+        raft_args = parser.parse_args()
+        raft_args.model = path_to_raft + raft_args.model 
 
         # Get openCV video writers 
         empty_out_dir(out_path)
@@ -414,11 +434,37 @@ if __name__=="__main__":
         video_writers = [cv2.VideoWriter(out_path + file_name, fourcc, fps, frame_size, isColor=True) for file_name in videos]
 
         # Run RAFT and scene flow 
-        flow = raft_and_scene_flow(args, depth_intrinsics, video_writers, split_index=split_number)
+        depth_intrinsics = get_intrinsics('/home/jrached/cv_project_code/project/data/highbay1/intrinsics/depth_intrinsics.csv')
+        raft_and_scene_flow(raft_args, alpha, flow_thresh, depth_intrinsics, video_writers, split_index=split_number, viz=False)
 
     else: 
-        vid_name = "/residual_flow.mp4"
-        print(f"\n Video path : {out_path + vid_name}\n")
         play_video(out_path, videos)
 
+
+if __name__=="__main__":
+    ######## To run: ####################################################
+    # python3 scene_flow.py --model=models/raft-things.pth --path=data/kimera2 
+    # python3 scene_flow.py --model=models/raft-things.pth --path=data/highbay1 
+    #####################################################################
+    # Data params
+    split_index = 3
+
+    # Residuals params
+    alpha = 0.8
+    flow_thresh = 5.0
+    
+    main(alpha, flow_thresh, split_index)
+
+
+
+    ###Old: Kimera dataset intrinsics
+    # RGB intrinsics 
+    # rgb_intrinsics = np.array([[380.80969238,   0.0,          315.84698486],
+    #                         [0.0,            380.53787231, 238.04495239],
+    #                         [0.0,            0.0,          1.0         ]])
+    
+    # # Depth intrinsics 
+    # depth_intrinsics = np.array([[386.88305664,   0.0,          312.75875854],
+    #                                 [  0.0,         386.88305664, 237.32907104],
+    #                                 [  0.0,         0.0,          1.0         ]])
     
