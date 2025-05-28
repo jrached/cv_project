@@ -17,6 +17,7 @@ import argparse
 import cv2 
 from PIL import Image 
 import torch 
+import glob 
 
 # Get RAFT's functions
 sys.path.append('../RAFT/core')
@@ -25,7 +26,8 @@ from utils import flow_viz
 from utils.utils import InputPadder
 
 DEVICE = 'cuda'
-MAX_DEPTH = 8
+MAX_DEPTH = 12 # 8 
+PX_RADIUS = 0.35
 
 #############################
 ### Data Extraction Code ####
@@ -69,7 +71,7 @@ def make_generators(path_to_split, split_index, num_samples=500):
     start = split_index * num_samples
     def depth_generator():
         for i in range(start, start + num_samples): 
-            yield np.clip(load_image(path_to_split + f'/depth/depth_img{i}.png', depth=True) / 1000, -0.5, MAX_DEPTH) # Convert to meters
+            yield load_image(path_to_split + f'/depth/depth_img{i}.png', depth=True) / 1000 # Convert to meters
 
     def rgb_generator(): 
         for i in range(start, start + num_samples): 
@@ -81,6 +83,55 @@ def make_generators(path_to_split, split_index, num_samples=500):
             yield pose 
 
     return depth_generator(), pose_generator(), rgb_generator()
+
+
+def make_generators2(data_path):
+    """
+    Makes generators from data from a given path. 
+
+    Inputs:
+        - Path to a video 
+
+    Outputs: 
+        - depth_generator
+        - pose_generator 
+        - rgb_generator 
+    """
+
+    # Create paths 
+    depth_path = data_path + '/depth'
+    color_path = data_path + '/color'
+    bd_poses_path = data_path + '/poses/bd_poses.csv'
+    px_poses_path = data_path + '/poses/px_poses.csv'
+    intrinsics_path = data_path + '/intrinsics/depth_intrinsics.csv'
+
+    # Make depth image generator 
+    num_frames = len(glob.glob(depth_path + '/*'))
+    def depth_generator():
+        for i in range(num_frames):
+            yield load_image(depth_path + f'/depth_img{i}.png', depth=True) / 1000
+    
+    # Make color image generator 
+    def color_generator():
+        for i in range(num_frames): 
+            yield load_image(color_path + f'/color_img{i}.png') 
+
+    # Make pose generator 
+    bd_poses = pd.read_csv(bd_poses_path).to_numpy().reshape(-1, 4, 4)
+    def bd_pose_generator():
+        for pose in bd_poses:
+            yield pose 
+    
+    # Make pose generator 
+    px_poses = pd.read_csv(px_poses_path).to_numpy().reshape(-1, 4, 4)
+    def px_pose_generator():
+        for pose in px_poses:
+            yield pose 
+
+    # Get intrinsics 
+    intrinsics = pd.read_csv(intrinsics_path).to_numpy().reshape(3, 3)
+
+    return depth_generator(), bd_pose_generator(), px_pose_generator(), color_generator(), intrinsics  
 
 
 ###############################
@@ -124,7 +175,7 @@ def scene_flow(curr_depth, prev_depth, curr_pose, prev_pose, intrinsics, inv_int
 
     # Remove coords with no depth measurements 
     prev_depth = prev_depth.flatten()
-    valid_mask = np.isfinite(prev_depth) & (prev_depth > 0)
+    valid_mask = np.isfinite(prev_depth) & (prev_depth > 0) & (prev_depth < MAX_DEPTH)
     valid_depth = prev_depth[valid_mask]
     valid_coords_c1 = pixel_coords_c1[valid_mask, :]
     flat_shape = valid_coords_c1.shape[0]
@@ -289,6 +340,83 @@ def raft_and_scene_flow(args, alpha, flow_thresh, intrinsics, video_writers, spl
         vw.release()
     cv2.destroyAllWindows()
 
+def raft_and_scene_flow2(args, alpha, flow_thresh, video_writers, viz=False):
+    """
+    Computes residuals between RAFT optical flow and geometric optical flow.  
+
+    inputs: 
+        - args, arguments for RAFT
+        - Camera intrinsics 
+        - OpenCV video writers to save flow videos
+        - Split_index (Optional)
+        - Viz, bool, whether to visualize flow frames as they are generated (Optional)
+    outputs: 
+        - The residuals for each frame 
+    """
+    # Initialize RAFT model  
+    model = torch.nn.DataParallel(RAFT(args))
+    model.load_state_dict(torch.load(args.model))
+    model = model.module
+    model.to(DEVICE)
+    model.eval()
+
+    # Get data generators 
+    path_to_split = args.path 
+    depth_generator, bd_pose_generator, px_pose_generator, rgb_generator, intrinsics = make_generators2(path_to_split)
+    inv_intrinsics = np.linalg.inv(intrinsics)
+
+    # Extract openCV video writers 
+    vw1, vw2, vw3, vw4, vw5, vw6 = video_writers 
+
+    with torch.no_grad():
+        # Initialize pose, depth, img.
+        for prev_depth, prev_bd_pose, prev_px_pose, prev_img in zip(depth_generator, bd_pose_generator, px_pose_generator, rgb_generator):
+            prev_img = prep_image(prev_img)
+            break
+
+        # Smoothing parameters
+        h, w = prev_depth.shape 
+        prev_flow = np.zeros((h, w, 2))
+
+        for curr_depth, curr_bd_pose, curr_px_pose, img in zip(depth_generator, bd_pose_generator, px_pose_generator, rgb_generator):
+            vw1.write(img[:, :, ::-1])
+
+            # Compute geometric flow 
+            prev_bd_pose_copy = prev_bd_pose.copy()
+            geo_flow, prev_depth, prev_bd_pose = scene_flow(curr_depth, prev_depth, curr_bd_pose, prev_bd_pose, intrinsics, inv_intrinsics, cam_to_rover=T_FLURDF)
+            vw2.write(flow_viz.flow_to_image(geo_flow)[:, :, ::-1])
+
+            # Compute RAFT flow  
+            raft_flow, prev_img = raft_optical_flow(model, img, prev_img)
+            vw3.write(flow_viz.flow_to_image(raft_flow)[:, :, ::-1])
+
+            # Compute residuals  
+            flow = raft_flow - geo_flow
+            vw4.write(flow_viz.flow_to_image(flow)[:, :, ::-1])
+
+            # Clean up signal 
+            processed_flow, prev_flow = post_process_flow(curr_depth, prev_depth, flow, prev_flow, alpha, flow_thresh, scale_by_depth=True)
+            vw5.write(flow_viz.flow_to_image(processed_flow)[:, :, ::-1])
+
+            # Generate flow masked video 
+            masked_frame = img.copy()
+            processed_flow_norms = np.broadcast_to(np.linalg.norm(processed_flow, axis=-1).reshape(h, w, 1), (h, w, 3))
+            masked_frame[processed_flow_norms == 0] = 0 
+            masked_frame[processed_flow_norms != 0] = 255
+            masked_frame2 = project_pose(curr_depth.shape, prev_bd_pose_copy, prev_px_pose, intrinsics, np.linalg.inv(T_FLURDF))
+            masked_frame[masked_frame2 == 0] = 0
+            vw6.write(masked_frame[:, :, ::-1])
+            prev_px_pose = curr_px_pose
+
+            # Visualize flow  
+            if viz: 
+                # viz_frame(img, processed_flow)
+                viz_mask(img, masked_frame)
+
+    for vw in video_writers: 
+        vw.release()
+    cv2.destroyAllWindows()
+
 
 ##########################
 ### Visualization Code ###
@@ -297,6 +425,21 @@ def viz_frame(img, flo):
     # map flow to rgb image
     flo = flow_viz.flow_to_image(flo)
     img_flo = np.concatenate([img[:, :, [2, 1, 0]], flo[:, :, [2, 1, 0]]], axis=0)
+
+    cv2.imshow('image', img_flo/255.0)
+    
+    # Wait for fps 
+    key = cv2.waitKey(1) & 0xFF 
+
+    # Break if q is pressed or video finished
+    if key == ord('q'):
+        return False
+    
+    return True
+
+def viz_mask(img, mask):
+    # map flow to rgb image
+    img_flo = np.concatenate([img[:, :, [2, 1, 0]], mask], axis=0)
 
     cv2.imshow('image', img_flo/255.0)
     
@@ -404,6 +547,43 @@ def empty_out_dir(out_path):
 def get_intrinsics(intrinsics_path):
     return pd.read_csv(intrinsics_path).to_numpy().reshape(3, 3)
 
+
+def project_pose(img_shape, bd_pose, px_pose, intrinsics, quad_to_cam):
+    """
+    Project the pose of the dynamic obstacle onto the image to produce a mask 
+
+    Inputs: 
+        - img_shape, depth image height and width
+        - Pose
+        - Intrinsics
+        - quad_to_cam transform  
+
+    Outputs: 
+        - masked image 
+    """
+
+    # Get height and width  
+    h, w = img_shape
+
+    # Project position 
+    pos = px_pose[:4, 3].reshape(4, 1)    
+    extrinsics = (quad_to_cam @ np.linalg.inv(bd_pose))    
+    points_3d = (extrinsics @ pos)[:3, :]
+    # depth = points_3d[2:]
+    pix_coords = intrinsics @ points_3d
+    depth = pix_coords[2:].copy()
+    pix_coords /= depth
+    pix_coords = pix_coords[:2, :] 
+
+    # Make mask
+    obj_radius = int(intrinsics[0, 0] * PX_RADIUS / depth[0, 0])
+    img = np.zeros(img_shape, dtype=np.uint8) 
+    u, v = int(pix_coords[0, 0]), int(pix_coords[1, 0]) 
+    if 0 <= u < w and 0 <= v < h: 
+        cv2.circle(img, (u, v), obj_radius, 255, thickness=-1)
+
+    return img 
+
 ############
 ### Main ###
 ############
@@ -412,7 +592,7 @@ def main(alpha, flow_thresh, split_number, only_viz=False):
 
     fps = 15 # 30.0
     frame_size = (848, 480) # OpenCV uses (width, height) order
-    out_path = f'/home/jrached/cv_project_code/project/data/highbay_out/split{split_number}'
+    out_path = f'/home/jrached/cv_project_code/project/data/filter_net/processed_flow/test1/videos'
     videos = ["/original.mp4", "/geometric_flow.mp4", "/raft_flow.mp4", "/residual_flow.mp4", "/processed_flow.mp4", "/flow_masked_image.mp4"]
     only_viz = True
 
@@ -434,8 +614,9 @@ def main(alpha, flow_thresh, split_number, only_viz=False):
         video_writers = [cv2.VideoWriter(out_path + file_name, fourcc, fps, frame_size, isColor=True) for file_name in videos]
 
         # Run RAFT and scene flow 
-        depth_intrinsics = get_intrinsics('/home/jrached/cv_project_code/project/data/highbay1/intrinsics/depth_intrinsics.csv')
-        raft_and_scene_flow(raft_args, alpha, flow_thresh, depth_intrinsics, video_writers, split_index=split_number, viz=False)
+        # depth_intrinsics = get_intrinsics('/home/jrached/cv_project_code/project/data/highbay1/intrinsics/depth_intrinsics.csv')
+        # raft_and_scene_flow(raft_args, alpha, flow_thresh, depth_intrinsics, video_writers, split_index=split_number, viz=True)
+        raft_and_scene_flow2(raft_args, alpha, flow_thresh, video_writers, viz=True)
 
     else: 
         play_video(out_path, videos)
@@ -445,6 +626,7 @@ if __name__=="__main__":
     ######## To run: ####################################################
     # python3 scene_flow.py --model=models/raft-things.pth --path=data/kimera2 
     # python3 scene_flow.py --model=models/raft-things.pth --path=data/highbay1 
+    # python3 scene_flow.py --model=models/raft-things.pth --path=data/filter_net/dataset/test1 
     #####################################################################
     # Data params
     split_index = 3
