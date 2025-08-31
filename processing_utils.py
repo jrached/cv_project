@@ -365,7 +365,7 @@ def generators_from_bag(out_path, depth_data, rgb_data, bd_interp_poses, bd_inte
     # Save odometry to dest folder 
     num_frames = len(depth_data.times) 
     bd_interp_poses = bd_interp_poses[:num_frames-1, :, :]
-    bd_interp_poses_flat = bd_interp_poses.reshape(num_frames, 16)
+    bd_interp_poses_flat = bd_interp_poses.reshape(num_frames-1, 16)
     pose_df = pd.DataFrame(bd_interp_poses_flat) 
     pose_df.to_csv(inputs + "/bd_poses.csv", index=False)
 
