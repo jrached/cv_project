@@ -104,7 +104,7 @@ def compute_trajectory_error(path_to_flow, depth_generator, quad_pose_generator,
         # Generate pixel coordinates
         h, w, _ = flow_frame.shape
         xs, ys = np.meshgrid(np.arange(w), np.arange(h))
-        pixel_coords = np.stack((xs, ys), axis=0).reshape(-1, 2)
+        pixel_coords = np.stack((xs, ys), axis=-1).reshape(-1, 2)
         pixel_coords = np.hstack((pixel_coords, np.ones((h*w, 1))))
 
         # Unproject onto 3D only pixels with depth that were also picked up by residual flow 
@@ -116,6 +116,9 @@ def compute_trajectory_error(path_to_flow, depth_generator, quad_pose_generator,
         if flat_shape == 0: continue # If we don't have valid pixel coords 
         points_3d = valid_depth.reshape(-1, 1) * (np.linalg.inv(depth_intrinsics) @ valid_coords.T).T 
         points_3d = np.hstack((points_3d, np.ones((flat_shape, 1))))
+
+        # Pick the points closest to camera #TODO test whether this metric actually works. #NOTE: Not much improvement from just average.
+        points_3d = points_3d[np.min(points_3d[:, 2]) == points_3d[:, 2]]
 
         # Transform into world frame 
         extrinsics = quad_pose @ cam_to_quad 
@@ -140,7 +143,7 @@ def test_split(split_index):
 
 if __name__ == '__main__':
     ########### To run: ####################################################
-    #python3 scene_flow.py --model=models/raft-things.pth --path=data/highbay1 
+    #python3 evaluate_performance.py --model=models/raft-things.pth --path=data/highbay1 
     ########################################################################
     split_index = 3
     flow_thresh = 5.0 
